@@ -65,6 +65,8 @@ Firmware project for the [Waveshare ESP32-S3-LCD-1.69](https://www.waveshare.com
 | Interface | 4-wire SPI |
 | Color depth | 16-bit RGB565 (262K colors) |
 
+> **Note:** The physical display bevel masks the corners of the active area with an approximate radius of **30 px**. UI elements placed within ~30 px of any corner may be partially obscured.
+
 ### Board Dimensions
 
 ![Dimensions](https://manuals.plus/wp-content/uploads/2025/05/WAVESHARE-ESP32-S3-LCD-1.69-Low-CostHigh-Performance-MCU-Board-fig-3.png)
@@ -153,3 +155,4 @@ pio run -t upload && pio device monitor
 - [ESP32-S3 Technical Reference Manual](https://files.waveshare.com/wiki/common/Esp32-s3_technical_reference_manual_en.pdf)
 - [Espressif ESP-IDF Docs — ESP32-S3](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/)
 - [Waveshare ESP32 Components (BSP)](https://github.com/waveshareteam/Waveshare-ESP32-components)
+- [QMI8658A Datasheet (local notes)](Documents/QMI8658A_Datasheet.md) — IMU register map, STATUS1 flags, tap/motion config parameters
