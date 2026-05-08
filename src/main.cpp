@@ -1,87 +1,64 @@
 /*
  * main.cpp — Waveshare ESP32-S3-LCD-1.69
  *
- * Top:    Analog clock face driven by PCF85063 RTC.
- * Bottom: Li-ion battery voltage gauge read from GPIO-1 ADC
- *         via a 200 kΩ / 100 kΩ voltage divider (ratio × 3).
+ * Top:    Analog clock face (lv_meter) driven by PCF85063 RTC.
+ * Bottom: Li-ion battery voltage gauge (lv_bar).
  */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
 #include "Arduino_GFX_Library.h"
 #include "SensorPCF85063.hpp"
 #include "pin_config.h"
+#include "lvgl.h"
+#include "esp_timer.h"
 
 /* ── Display ─────────────────────────────────────────────────────────────── */
-Arduino_DataBus *bus =
+static Arduino_DataBus *bus =
     new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
-Arduino_GFX *gfx =
+static Arduino_GFX *gfx =
     new Arduino_ST7789(bus, LCD_RST, 0 /*rotation*/, true /*IPS*/,
                        LCD_WIDTH, LCD_HEIGHT, 0, 20 /*y-offset*/, 0, 0);
 
+/* ── LVGL draw buffer (1/10 of screen height) ────────────────────────────── */
+static lv_color_t lvBuf[LCD_WIDTH * 28];
+
 /* ── RTC ─────────────────────────────────────────────────────────────────── */
-SensorPCF85063 rtc;
-bool rtcOk = false;
+static SensorPCF85063 rtc;
+static bool rtcOk = false;
 
-/* ── Clock geometry ──────────────────────────────────────────────────────── */
-static const int16_t CX = 120;
-static const int16_t CY = 112;
-static const int16_t R  = 108;
+/* ── UI handles ──────────────────────────────────────────────────────────── */
+static lv_obj_t           *clockMeter = nullptr;
+static lv_meter_indicator_t *indH     = nullptr;
+static lv_meter_indicator_t *indM     = nullptr;
+static lv_meter_indicator_t *indS     = nullptr;
+static lv_obj_t *batBar   = nullptr;
+static lv_obj_t *batVolts = nullptr;
+static lv_obj_t *batPct   = nullptr;
 
-static const int16_t S_LEN        = R * 87 / 100;
-static const int16_t M_LEN        = R * 73 / 100;
-static const int16_t H_LEN        = R * 52 / 100;
-static const int16_t TICK_MAJOR_I = R * 90 / 100;
-static const int16_t TICK_MINOR_I = R * 95 / 100;
-
-/* ── Colors ──────────────────────────────────────────────────────────────── */
-static const uint16_t C_BG   = 0x0000;   // BLACK
-static const uint16_t C_RING = 0x2965;   // dark navy
-static const uint16_t C_MARK = 0xFFFF;   // WHITE
-static const uint16_t C_SUB  = 0x4A49;   // dim grey
-static const uint16_t C_HOUR = 0xFFFF;   // WHITE
-static const uint16_t C_MIN  = 0x07FF;   // cyan
-static const uint16_t C_SEC  = 0xF800;   // RED
-static const uint16_t C_DOT  = 0xFFFF;   // WHITE
-static const uint16_t C_SEP  = 0x2965;   // dark navy
-
-/* ── Voltage gauge geometry ──────────────────────────────────────────────── */
-static const int16_t GX   = 18;
-static const int16_t GY   = 244;
-static const int16_t GW   = 204;
-static const int16_t GH   = 22;
-static const float   VMIN = 3.0f;
-static const float   VMAX = 4.2f;
-
-/* ── ADC ─────────────────────────────────────────────────────────────────── */
-static const float V_DIV = 3.0f;
-
-/* ── Trig constants ──────────────────────────────────────────────────────── */
-static const float SIXTIETH_RAD = 0.10471976f;
-static const float TWELFTH_RAD  = 0.52359878f;
-static const float HALF_PI_F    = 1.5707963f;
-
-/* ── Hand state ──────────────────────────────────────────────────────────── */
+/* ── Time state ──────────────────────────────────────────────────────────── */
 static int16_t tH = 12, tM = 0, tS = 0;
-static int16_t osx, osy, omx, omy, ohx, ohy;
 
 static unsigned long nextSecond  = 0;
 static unsigned long nextVoltage = 0;
 
 /* ═════════════════════════════════════════════════════════════════════════ *
- *  Helpers
+ *  LVGL integration
  * ═════════════════════════════════════════════════════════════════════════ */
 
-static void handTip(float rad, int16_t len, int16_t &x, int16_t &y)
+static void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf)
 {
-    x = CX + (int16_t)(cosf(rad - HALF_PI_F) * len);
-    y = CY + (int16_t)(sinf(rad - HALF_PI_F) * len);
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
+    gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)buf, w, h);
+    lv_disp_flush_ready(drv);
 }
 
-static float secAngle(int s)        { return SIXTIETH_RAD * s; }
-static float minAngle(int m, int s) { return SIXTIETH_RAD * m + SIXTIETH_RAD * s / 60.0f; }
-static float hrAngle (int h, int m) { return TWELFTH_RAD  * (h % 12) + TWELFTH_RAD * m / 60.0f; }
+static void tickCb(void *) { lv_tick_inc(2); }
+
+/* ═════════════════════════════════════════════════════════════════════════ *
+ *  Helpers
+ * ═════════════════════════════════════════════════════════════════════════ */
 
 static uint8_t parse2(const char *p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 
@@ -94,140 +71,141 @@ static uint8_t parseMonth(const char *d)
     return 1;
 }
 
-/* ═════════════════════════════════════════════════════════════════════════ *
- *  Clock face
- * ═════════════════════════════════════════════════════════════════════════ */
-
-static void drawTicks()
-{
-    for (uint8_t i = 0; i < 60; i++) {
-        float a  = SIXTIETH_RAD * i - HALF_PI_F;
-        float ca = cosf(a), sa = sinf(a);
-        bool  major = (i % 5 == 0);
-        int16_t  ri = major ? TICK_MAJOR_I : TICK_MINOR_I;
-        uint16_t c  = major ? C_MARK       : C_SUB;
-        gfx->drawLine(
-            CX + (int16_t)(ca * R),  CY + (int16_t)(sa * R),
-            CX + (int16_t)(ca * ri), CY + (int16_t)(sa * ri), c);
-    }
-}
-
-static void drawClockFace()
-{
-    gfx->fillCircle(CX, CY, R,     C_RING);
-    gfx->fillCircle(CX, CY, R - 3, C_BG);
-    drawTicks();
-}
-
-/* ═════════════════════════════════════════════════════════════════════════ *
- *  Hands
- * ═════════════════════════════════════════════════════════════════════════ */
-
-static void drawHands(int16_t h, int16_t m, int16_t s)
-{
-    handTip(secAngle(s),    S_LEN, osx, osy);
-    handTip(minAngle(m, s), M_LEN, omx, omy);
-    handTip(hrAngle(h, m),  H_LEN, ohx, ohy);
-
-    gfx->drawLine(CX, CY, ohx, ohy, C_HOUR);
-    gfx->drawLine(CX, CY, omx, omy, C_MIN);
-    gfx->drawLine(CX, CY, osx, osy, C_SEC);
-    gfx->fillCircle(CX, CY, 4, C_DOT);
-}
-
-static void updateHands(int16_t h, int16_t m, int16_t s)
-{
-    int16_t sx, sy, mx, my, hx, hy;
-    handTip(secAngle(s),    S_LEN, sx, sy);
-    handTip(minAngle(m, s), M_LEN, mx, my);
-    handTip(hrAngle(h, m),  H_LEN, hx, hy);
-
-    if (sx == osx && sy == osy) return;
-
-    gfx->startWrite();
-
-    gfx->writeLine(CX, CY, osx, osy, C_BG);
-    if (mx != omx || my != omy) gfx->writeLine(CX, CY, omx, omy, C_BG);
-    if (hx != ohx || hy != ohy) gfx->writeLine(CX, CY, ohx, ohy, C_BG);
-
-    // Restore any tick marks the erased lines crossed
-    for (uint8_t i = 0; i < 60; i++) {
-        float a  = SIXTIETH_RAD * i - HALF_PI_F;
-        float ca = cosf(a), sa = sinf(a);
-        bool  major = (i % 5 == 0);
-        int16_t  ri = major ? TICK_MAJOR_I : TICK_MINOR_I;
-        uint16_t c  = major ? C_MARK       : C_SUB;
-        gfx->writeLine(
-            CX + (int16_t)(ca * R),  CY + (int16_t)(sa * R),
-            CX + (int16_t)(ca * ri), CY + (int16_t)(sa * ri), c);
-    }
-
-    gfx->writeLine(CX, CY, hx, hy, C_HOUR);
-    gfx->writeLine(CX, CY, mx, my, C_MIN);
-    gfx->writeLine(CX, CY, sx, sy, C_SEC);
-    for (int16_t dy = -4; dy <= 4; dy++)
-        for (int16_t dx = -4; dx <= 4; dx++)
-            if (dx*dx + dy*dy <= 16)
-                gfx->writePixel(CX + dx, CY + dy, C_DOT);
-
-    gfx->endWrite();
-
-    ohx = hx; ohy = hy;
-    omx = mx; omy = my;
-    osx = sx; osy = sy;
-}
-
-/* ═════════════════════════════════════════════════════════════════════════ *
- *  Voltage gauge
- * ═════════════════════════════════════════════════════════════════════════ */
+/* Map clock time to 0-60 meter scale */
+static int16_t hourVal(int h, int m) { return (h % 12) * 5 + m / 12; }
 
 static float readVoltage()
 {
     int32_t sum = 0;
     for (int i = 0; i < 16; i++) sum += analogRead(VBAT_PIN);
-    float adcV = (sum / 16.0f) * (3.3f / 4095.0f);
-    return adcV * V_DIV;
+    return (sum / 16.0f) * (3.3f / 4095.0f) * 3.0f;
 }
 
-static void drawVoltageGauge(float v)
+/* ═════════════════════════════════════════════════════════════════════════ *
+ *  UI construction
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void createClockMeter()
 {
-    float pct = constrain((v - VMIN) / (VMAX - VMIN), 0.0f, 1.0f);
-    int16_t filled = (int16_t)(pct * GW);
+    clockMeter = lv_meter_create(lv_scr_act());
+    lv_obj_set_size(clockMeter, 224, 224);
+    lv_obj_align(clockMeter, LV_ALIGN_TOP_MID, 0, 2);
 
-    uint16_t barColor;
-    if      (pct > 0.60f) barColor = 0x07E0;
-    else if (pct > 0.25f) barColor = 0xFFE0;
-    else                  barColor = 0xF800;  // RED
+    /* Black background, no border */
+    lv_obj_set_style_bg_color(clockMeter, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(clockMeter, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(clockMeter, lv_color_make(0x29, 0x65, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_radius(clockMeter, 30, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(clockMeter, 6, LV_PART_MAIN);
 
-    gfx->fillRect(0, 228, LCD_WIDTH, LCD_HEIGHT - 228, C_BG);
-    gfx->drawFastHLine(0, 229, LCD_WIDTH, C_SEP);
+    lv_meter_scale_t *scale = lv_meter_add_scale(clockMeter);
 
-    gfx->setTextSize(1);
-    gfx->setTextColor(0x8410);
-    gfx->setCursor(GX, 234);
-    gfx->print("BATTERY");
+    /* Minor ticks: 61 marks (0..60), one per second position */
+    lv_meter_set_scale_ticks(clockMeter, scale,
+                             61, 1, 7, lv_color_make(0x40, 0x40, 0x40));
+
+    /* Major ticks: every 5th (12 hour marks) */
+    lv_meter_set_scale_major_ticks(clockMeter, scale,
+                                   5, 3, 13, lv_color_white(), 0);
+
+    /* Full 360° scale, value 0 starts at 12 o'clock (270° from 3 o'clock) */
+    lv_meter_set_scale_range(clockMeter, scale, 0, 60, 360, 270);
+
+    /* Hide numeric labels on major ticks */
+    lv_obj_set_style_text_opa(clockMeter, LV_OPA_TRANSP, LV_PART_TICKS);
+
+    /* Hour hand — thick, white */
+    indH = lv_meter_add_needle_line(clockMeter, scale, 4, lv_color_white(), -38);
+    /* Minute hand — medium, cyan */
+    indM = lv_meter_add_needle_line(clockMeter, scale, 2,
+                                    lv_color_make(0x00, 0xFF, 0xFF), -22);
+    /* Second hand — thin, red */
+    indS = lv_meter_add_needle_line(clockMeter, scale, 1,
+                                    lv_color_make(0xFF, 0x00, 0x00), -8);
+}
+
+static void createBatteryBar()
+{
+    /* Thin separator */
+    lv_obj_t *sep = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(sep, LCD_WIDTH, 1);
+    lv_obj_set_pos(sep, 0, 229);
+    lv_obj_set_style_bg_color(sep, lv_color_make(0x29, 0x65, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_border_width(sep, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(sep, 0, LV_PART_MAIN);
+
+    /* Container for battery widgets */
+    lv_obj_t *cont = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(cont, LCD_WIDTH, 49);
+    lv_obj_set_pos(cont, 0, 231);
+    lv_obj_set_style_bg_color(cont, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(cont, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(cont, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(cont, 0, LV_PART_MAIN);
+
+    /* "BATTERY" label */
+    lv_obj_t *title = lv_label_create(cont);
+    lv_label_set_text(title, "BATTERY");
+    lv_obj_set_style_text_color(title, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 3);
+
+    /* Voltage value (right-aligned) */
+    batVolts = lv_label_create(cont);
+    lv_label_set_text(batVolts, "-.-- V");
+    lv_obj_set_style_text_color(batVolts, lv_color_white(), 0);
+    lv_obj_set_style_text_font(batVolts, &lv_font_montserrat_12, 0);
+    lv_obj_align(batVolts, LV_ALIGN_TOP_RIGHT, -10, 3);
+
+    /* Progress bar */
+    batBar = lv_bar_create(cont);
+    lv_obj_set_size(batBar, 204, 22);
+    lv_obj_align(batBar, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_bar_set_range(batBar, 0, 100);
+    lv_obj_set_style_bg_color(batBar, lv_color_make(0x18, 0x18, 0x18), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(batBar, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(batBar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(batBar, 3, LV_PART_INDICATOR);
+
+    /* Percentage centered on bar */
+    batPct = lv_label_create(batBar);
+    lv_label_set_text(batPct, "0%");
+    lv_obj_set_style_text_color(batPct, lv_color_white(), 0);
+    lv_obj_set_style_text_font(batPct, &lv_font_montserrat_12, 0);
+    lv_obj_center(batPct);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════ *
+ *  Update functions
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void updateClock()
+{
+    lv_meter_set_indicator_value(clockMeter, indH, hourVal(tH, tM));
+    lv_meter_set_indicator_value(clockMeter, indM, tM);
+    lv_meter_set_indicator_value(clockMeter, indS, tS);
+}
+
+static void updateVoltage()
+{
+    float v   = readVoltage();
+    float pct = (v - 3.0f) / (4.2f - 3.0f) * 100.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+
+    lv_color_t barColor = (pct > 60.0f) ? lv_palette_main(LV_PALETTE_GREEN)
+                        : (pct > 25.0f) ? lv_palette_main(LV_PALETTE_YELLOW)
+                                        : lv_palette_main(LV_PALETTE_RED);
+    lv_obj_set_style_bg_color(batBar, barColor, LV_PART_INDICATOR);
+    lv_bar_set_value(batBar, (int32_t)pct, LV_ANIM_OFF);
 
     char buf[12];
     snprintf(buf, sizeof(buf), "%.2f V", v);
-    gfx->setTextColor(0xFFFF);  // WHITE
-    gfx->setCursor(GX + GW - (int16_t)strlen(buf) * 6, 234);
-    gfx->print(buf);
+    lv_label_set_text(batVolts, buf);
 
-    gfx->fillRect(GX, GY, GW, GH, 0x18C3);
-    if (filled > 0)
-        gfx->fillRect(GX, GY, filled, GH, barColor);
-    gfx->drawRect(GX, GY, GW, GH, 0x528A);
-
-    char pctBuf[6];
-    snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(pct * 100.0f + 0.5f));
-    int16_t tx = GX + (GW - (int16_t)strlen(pctBuf) * 6) / 2;
-    int16_t ty = GY + (GH - 8) / 2;
-    gfx->setCursor(tx + 1, ty + 1);
-    gfx->setTextColor(0x0000);
-    gfx->print(pctBuf);
-    gfx->setCursor(tx, ty);
-    gfx->setTextColor(0xFFFF);  // WHITE
-    gfx->print(pctBuf);
+    snprintf(buf, sizeof(buf), "%d%%", (int)(pct + 0.5f));
+    lv_label_set_text(batPct, buf);
+    lv_obj_center(batPct);
 }
 
 /* ═════════════════════════════════════════════════════════════════════════ *
@@ -239,13 +217,34 @@ void setup()
     Serial.begin(115200);
 
     gfx->begin();
-    gfx->fillScreen(C_BG);
+    gfx->fillScreen(0x0000);
     pinMode(LCD_BL, OUTPUT);
     digitalWrite(LCD_BL, HIGH);
 
     analogReadResolution(12);
     pinMode(VBAT_PIN, INPUT);
 
+    /* ── LVGL ───────────────────────────────────────────────────────────── */
+    lv_init();
+
+    static lv_disp_draw_buf_t drawBuf;
+    lv_disp_draw_buf_init(&drawBuf, lvBuf, nullptr, LCD_WIDTH * 28);
+
+    static lv_disp_drv_t dispDrv;
+    lv_disp_drv_init(&dispDrv);
+    dispDrv.hor_res  = LCD_WIDTH;
+    dispDrv.ver_res  = LCD_HEIGHT;
+    dispDrv.flush_cb = flushCb;
+    dispDrv.draw_buf = &drawBuf;
+    lv_disp_drv_register(&dispDrv);
+
+    /* 2 ms tick via esp_timer */
+    esp_timer_handle_t tickTimer;
+    const esp_timer_create_args_t timerArgs = { .callback = tickCb, .name = "lv_tick" };
+    esp_timer_create(&timerArgs, &tickTimer);
+    esp_timer_start_periodic(tickTimer, 2000);
+
+    /* ── RTC ─────────────────────────────────────────────────────────────── */
     rtcOk = rtc.begin(Wire, PCF85063_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
     if (rtcOk) {
         if (!rtc.isRunning()) {
@@ -266,9 +265,17 @@ void setup()
         Serial.println("RTC not found — running on millis()");
     }
 
-    drawClockFace();
-    drawHands(tH, tM, tS);
-    drawVoltageGauge(readVoltage());
+    /* ── Screen ─────────────────────────────────────────────────────────── */
+    lv_theme_t *th = lv_theme_basic_init(lv_disp_get_default());
+    lv_disp_set_theme(lv_disp_get_default(), th);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+    lv_obj_set_style_radius(lv_scr_act(), 16, 0);
+    lv_obj_set_style_clip_corner(lv_scr_act(), true, 0);
+
+    createClockMeter();
+    createBatteryBar();
+    updateClock();
+    updateVoltage();
 
     nextSecond  = ((millis() / 1000) + 1) * 1000;
     nextVoltage = millis() + 10000UL;
@@ -276,6 +283,8 @@ void setup()
 
 void loop()
 {
+    lv_timer_handler();
+
     unsigned long now = millis();
 
     if (now >= nextSecond) {
@@ -285,20 +294,14 @@ void loop()
             RTC_DateTime dt = rtc.getDateTime();
             tH = dt.hour; tM = dt.minute; tS = dt.second;
         } else {
-            if (++tS >= 60) {
-                tS = 0;
-                if (++tM >= 60) {
-                    tM = 0;
-                    if (++tH >= 24) tH = 0;
-                }
-            }
+            if (++tS >= 60) { tS = 0; if (++tM >= 60) { tM = 0; if (++tH >= 24) tH = 0; } }
         }
 
-        updateHands(tH, tM, tS);
+        updateClock();
     }
 
     if (now >= nextVoltage) {
         nextVoltage = now + 10000UL;
-        drawVoltageGauge(readVoltage());
+        updateVoltage();
     }
 }
