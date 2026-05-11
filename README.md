@@ -133,18 +133,47 @@ The header exposes general-purpose GPIO and the shared I²C / UART buses. The LC
 
 ## Firmware
 
-### ClockAndVoltage
+### Main firmware — `src/main.cpp`
 
-**[ClockAndVoltage/](ClockAndVoltage/)** — Arduino sketch combining:
+PlatformIO project in the repo root. Libraries are fetched automatically on first build.
 
-- **Analog clock** — reads real time from the PCF85063 RTC. On first boot (or after backup battery loss) it seeds the RTC from the compile timestamp. Hands erase cleanly by restoring tick marks before redrawing.
-- **Battery voltage gauge** — reads the VBAT rail via the onboard 200 kΩ / 100 kΩ divider on GPIO 1. Displays a colour-coded bar (green → yellow → red) with percentage and voltage, updated every 10 s.
+#### Features
 
-**Build with PlatformIO** — libraries are fetched automatically:
+- **Analog clock** — reads real time from the PCF85063 RTC. Seeds from compile timestamp on first boot or after backup-battery loss.
+- **Battery gauge** — reads the VBAT rail via the onboard 200 kΩ / 100 kΩ divider on GPIO 1. Colour-coded bar with percentage and voltage, updated every 10 s.
+- **8 colour palettes × day / night** — each palette has a distinct mood; all UI elements (clock face, hands, ticks, battery bar, bubble) are recoloured together.
+
+| # | Name | Character |
+|---|------|-----------|
+| 0 | Forest | Greens |
+| 1 | Ocean | Blues |
+| 2 | Sunset | Warm oranges |
+| 3 | Midnight | Purples |
+| 4 | Fire | Reds |
+| 5 | Arctic | Cyan / ice |
+| 6 | Neon | High-contrast cyan / magenta |
+| 7 | Copper | Bronze / brown |
+
+- **Level bubble** — a translucent circle overlaid on the clock face tracks the board's tilt in real time using the QMI8658 accelerometer. A faint centre ring indicates the level position.
+
+#### Gestures (QMI8658 tap detection)
+
+| Gesture | Action |
+|---------|--------|
+| Single tap | Cycle to next colour palette |
+| Double tap | Toggle day / night variant |
+
+#### Build & flash
 
 ```powershell
 pio run -t upload && pio device monitor
 ```
+
+---
+
+### Reference sketch — `ClockAndVoltage/`
+
+**[ClockAndVoltage/](ClockAndVoltage/)** — original bare-GFX Arduino sketch (no LVGL, no palettes). Kept as a minimal reference for direct ST7789 drawing.
 
 ---
 

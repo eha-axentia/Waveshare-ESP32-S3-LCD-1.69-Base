@@ -302,6 +302,15 @@ static lv_obj_t *batBar   = nullptr;
 static lv_obj_t *batVolts = nullptr;
 static lv_obj_t *batPct   = nullptr;
 
+/* ── Level bubble ─────────────────────────────────────────────────────────── */
+static lv_obj_t *levelBubble = nullptr;
+static lv_obj_t *levelCenter = nullptr;
+
+static constexpr int16_t BUBBLE_R     =  8;   /* bubble radius px            */
+static constexpr int16_t BUBBLE_RANGE = 68;   /* max offset from clock centre */
+static constexpr int16_t CLOCK_CX     = 120;  /* 240/2                        */
+static constexpr int16_t CLOCK_CY     = 114;  /* 2 (y_ofs) + 224/2            */
+
 /* ── Time state ──────────────────────────────────────────────────────────── */
 static int16_t tH = 12, tM = 0, tS = 0;
 static unsigned long nextSecond  = 0;
@@ -309,15 +318,22 @@ static unsigned long nextVoltage = 0;
 
 /* ── Gesture state ───────────────────────────────────────────────────────── */
 static unsigned long tapDebounceUntil   = 0;
-static unsigned long firstTapAt         = 0;   /* 0 = no pending tap */
 static unsigned long shakeDebounceUntil = 0;
 static unsigned long shakeRtcResumeAt  = 0;
-
-static const unsigned long DOUBLE_TAP_MS = 400;
 
 /* ═════════════════════════════════════════════════════════════════════════ *
  *  LVGL integration
  * ═════════════════════════════════════════════════════════════════════════ */
+
+/* ── Direct QMI8658 register read (SensorLib has no public TAP_STATUS getter) */
+static uint8_t readQMIReg(uint8_t reg)
+{
+    Wire.beginTransmission(QMI8658_L_SLAVE_ADDRESS);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)QMI8658_L_SLAVE_ADDRESS, (uint8_t)1);
+    return Wire.available() ? (uint8_t)Wire.read() : 0;
+}
 
 static void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf)
 {
@@ -459,6 +475,64 @@ static void createBatteryBar()
     lv_obj_center(batPct);
 }
 
+static void createLevelBubble()
+{
+    const Palette &p = pal();
+
+    /* Faint center ring — indicates the "level" position */
+    levelCenter = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(levelCenter, 22, 22);
+    lv_obj_clear_flag(levelCenter, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(levelCenter,      LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(levelCenter,      LV_OPA_TRANSP,    0);
+    lv_obj_set_style_border_color(levelCenter, p.accent,         0);
+    lv_obj_set_style_border_width(levelCenter, 1,                0);
+    lv_obj_set_style_opa(levelCenter,          LV_OPA_40,        0);
+    lv_obj_set_pos(levelCenter, CLOCK_CX - 11, CLOCK_CY - 11);
+
+    /* Moving bubble */
+    levelBubble = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(levelBubble, BUBBLE_R * 2, BUBBLE_R * 2);
+    lv_obj_clear_flag(levelBubble, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(levelBubble,       LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(levelBubble,     p.handS,          0);
+    lv_obj_set_style_bg_opa(levelBubble,       LV_OPA_COVER,     0);
+    lv_obj_set_style_border_color(levelBubble, p.accent,         0);
+    lv_obj_set_style_border_width(levelBubble, 1,                0);
+    lv_obj_set_style_opa(levelBubble,          LV_OPA_70,        0);
+    lv_obj_set_pos(levelBubble, CLOCK_CX - BUBBLE_R, CLOCK_CY - BUBBLE_R);
+}
+
+static void updateBubble()
+{
+    if (!levelBubble || !imuOk) return;
+    if (!imu.getDataReady()) return;
+
+    float ax, ay, az;
+    imu.getAccelerometer(ax, ay, az);
+
+    /* Smooth to reduce jitter at 20 Hz polling rate */
+    static float sax = 0.0f, say = 0.0f;
+    sax = 0.25f * ax + 0.75f * sax;
+    say = 0.25f * ay + 0.75f * say;
+
+    /* Axes swapped relative to physical mounting: ay drives left/right,
+     * ax drives up/down.  Scale × 5 so ~0.2 g reaches the full boundary. */
+    float dx =  say * (float)BUBBLE_RANGE * 5.0f;
+    float dy = -sax * (float)BUBBLE_RANGE * 5.0f;
+
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist > (float)BUBBLE_RANGE) {
+        float s = (float)BUBBLE_RANGE / dist;
+        dx *= s;
+        dy *= s;
+    }
+
+    lv_obj_set_pos(levelBubble,
+                   CLOCK_CX - BUBBLE_R + (int16_t)roundf(dx),
+                   CLOCK_CY - BUBBLE_R + (int16_t)roundf(dy));
+}
+
 /* ═════════════════════════════════════════════════════════════════════════ *
  *  Palette application  (delete + recreate UI, preserve time/voltage)
  * ═════════════════════════════════════════════════════════════════════════ */
@@ -469,6 +543,8 @@ static void updateVoltage();
 
 static void applyPalette()
 {
+    if (levelBubble) { lv_obj_del(levelBubble); levelBubble = nullptr; }
+    if (levelCenter) { lv_obj_del(levelCenter); levelCenter = nullptr; }
     if (clockMeter) {
         lv_anim_del(clockMeter, nullptr);   /* cancel running hand animations */
         lv_obj_del(clockMeter);
@@ -485,6 +561,7 @@ static void applyPalette()
 
     createClockMeter();
     createBatteryBar();
+    createLevelBubble();   /* created last so it renders on top */
     updateClock();
     updateVoltage();
 
@@ -540,13 +617,18 @@ static void handleTap()
 {
     unsigned long now = millis();
     if (now < tapDebounceUntil) return;
-    tapDebounceUntil = now + 120;
+    tapDebounceUntil = now + 300;
 
-    if (firstTapAt != 0 && (now - firstTapAt) < DOUBLE_TAP_MS) {
-        firstTapAt = 0;
+    /* QMI8658_REG_TAP_STATUS 0x59: bits 0-1 = 0 none, 1 single, 2 double.
+     * The chip waits for dTapWindow after the first tap before firing STATUS1,
+     * so the type is already resolved when we read it here. */
+    uint8_t tapType = readQMIReg(0x59) & 0x03;
+    Serial.printf("TAP type=%u\n", tapType);
+
+    if (tapType == 2) {
         toggleDayNight();
     } else {
-        firstTapAt = now;
+        cyclePalette();
     }
 }
 
@@ -629,10 +711,17 @@ void setup()
         imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
                                 SensorQMI8658::ACC_ODR_500Hz,
                                 SensorQMI8658::LPF_MODE_0, false);
-        imu.configTap(SensorQMI8658::PRIORITY0, 20, 50, 250, 16, 64, 0x0320, 0x0190);
+        /* peakMagThr lowered to 0x00C8 (~0.2 g²) — original 0x0320 was too high.
+         * dTapWindow = 100 samples @ 500 Hz = 200 ms double-tap window. */
+        imu.configTap(SensorQMI8658::PRIORITY0,
+                      15,     /* peakWindow  */
+                      25,     /* tapWindow   */
+                      100,    /* dTapWindow  */
+                      16,     /* alpha       */
+                      64,     /* gamma       */
+                      0x00C8, /* peakMagThr  */
+                      0x0050  /* UDMThr      */);
         imu.enableTap();
-        imu.configMotion(100, 100, 100, 0, 0, 0, 0x07, 5, 0, 0, 0);
-        imu.enableMotionDetect();
         imu.enableAccelerometer();
         Serial.printf("IMU OK  id=0x%02X\n", imu.getChipID());
     } else {
@@ -657,19 +746,14 @@ void loop()
 
     unsigned long now = millis();
 
-    /* ── Pending single-tap: fire after double-tap window expires ─────────── */
-    if (firstTapAt != 0 && (now - firstTapAt) >= DOUBLE_TAP_MS) {
-        firstTapAt = 0;
-        cyclePalette();
-    }
-
     /* ── IMU polling (every 50 ms) ────────────────────────────────────────── */
     static unsigned long nextImuPoll = 0;
     if (imuOk && now >= nextImuPoll) {
         nextImuPoll = now + 50;
         uint8_t status = (uint8_t)imu.getStatusRegister();
+        if (status) Serial.printf("STATUS1=0x%02X\n", status);
         if (status & SensorQMI8658::EVENT_TAP_MOTION) handleTap();
-        if (status & SensorQMI8658::EVENT_ANY_MOTION)  handleShake();
+        updateBubble();
     }
 
     /* ── Clock tick ───────────────────────────────────────────────────────── */
